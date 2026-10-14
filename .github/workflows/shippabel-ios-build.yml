@@ -1,0 +1,111 @@
+name: Shippabel iOS Build
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        required: true
+        type: string
+      submission_id:
+        required: true
+        type: string
+      platform:
+        required: true
+        type: choice
+        options: [ios]
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select App Store SDK
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - name: Build the web app and prepare iOS
+        run: |
+          npm install
+          npm run build
+          if [ ! -d node_modules/@capacitor/ios ]; then npm install "@capacitor/ios@$(node -p 'require("@capacitor/core/package.json").version')"; fi
+          if [ ! -d ios ]; then npx cap add ios; fi
+          npx cap sync ios
+      - name: Install App Store signing credentials
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          PROFILE: ${{ secrets.APPLE_PROVISION_PROFILE_BASE64 }}
+        run: |
+          umask 077
+          python3 <<'PY'
+          import base64,os
+          for key,file in [('CERTIFICATE','certificate.p12'),('PROFILE','profile.mobileprovision')]:
+            if not os.environ.get(key): raise Exception('Missing App Store signing credential: '+key)
+            open(os.path.join(os.environ['RUNNER_TEMP'],file),'wb').write(base64.b64decode(''.join(os.environ[key].split()),validate=True))
+          PY
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 32)
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/shippabel.keychain-db"
+          security set-keychain-settings -lut 3600 "$RUNNER_TEMP/shippabel.keychain-db"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/shippabel.keychain-db"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$RUNNER_TEMP/shippabel.keychain-db"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/shippabel.keychain-db"
+          security list-keychains -d user -s "$RUNNER_TEMP/shippabel.keychain-db"
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          python3 <<'PY'
+          import json,os,plistlib,shutil
+          p=plistlib.load(open(os.path.join(os.environ['RUNNER_TEMP'],'profile.plist'),'rb'))
+          if p.get('ProvisionedDevices') or p.get('ProvisionsAllDevices'): raise Exception('Use an App Store distribution provisioning profile')
+          bundle=json.load(open('capacitor.config.json'))['appId']
+          if p['Entitlements']['application-identifier'].split('.',1)[1]!=bundle: raise Exception('Provisioning profile does not match the app bundle ID')
+          directory=os.path.expanduser('~/Library/MobileDevice/Provisioning Profiles')
+          os.makedirs(directory,exist_ok=True)
+          shutil.copy(os.path.join(os.environ['RUNNER_TEMP'],'profile.mobileprovision'),os.path.join(directory,p['UUID']+'.mobileprovision'))
+          with open(os.environ['GITHUB_ENV'],'a') as env: env.write('APPLE_TEAM_ID='+p['TeamIdentifier'][0]+'\nPROFILE_UUID='+p['UUID']+'\nBUNDLE_ID='+bundle+'\n')
+          PY
+      - name: Archive and export a signed IPA
+        run: |
+          gem install fastlane --no-document
+          mkdir -p fastlane
+          cat > fastlane/Fastfile <<'RUBY'
+          lane :build do
+            increment_build_number(build_number: ENV.fetch('GITHUB_RUN_NUMBER'), xcodeproj: 'ios/App/App.xcodeproj')
+            target = File.exist?('../ios/App/App.xcworkspace') ? {workspace: 'ios/App/App.xcworkspace'} : {project: 'ios/App/App.xcodeproj'}
+            build_app(**target, scheme: 'App', configuration: 'Release', export_method: 'app-store',
+              output_directory: 'output', output_name: 'build.ipa', clean: true,
+              xcargs: "CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=#{ENV.fetch('APPLE_TEAM_ID')} PROVISIONING_PROFILE_SPECIFIER=#{ENV.fetch('PROFILE_UUID')} CODE_SIGN_IDENTITY='Apple Distribution'",
+              export_options: {method: 'app-store-connect', signingStyle: 'manual', teamID: ENV.fetch('APPLE_TEAM_ID'), provisioningProfiles: {ENV.fetch('BUNDLE_ID') => ENV.fetch('PROFILE_UUID')}})
+          end
+          RUBY
+          fastlane build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-ios
+          path: output/*.ipa
+          if-no-files-found: error
+          retention-days: 30
+      - name: Notify Shippabel
+        if: always()
+        env:
+          PROJECT_ID: ${{ inputs.project_id }}
+          SUBMISSION_ID: ${{ inputs.submission_id }}
+          RUN_ID: ${{ github.run_id }}
+          JOB_STATUS: ${{ job.status }}
+          CALLBACK_TOKEN: ${{ secrets.SHIPPABEL_CALLBACK_SECRET }}
+        run: |
+          node --input-type=module <<'NODE'
+          const body={project_id:process.env.PROJECT_ID,submission_id:process.env.SUBMISSION_ID,run_id:process.env.RUN_ID,status:process.env.JOB_STATUS};
+          let ok=false;
+          for(let attempt=0;attempt<4;attempt++){try{const r=await fetch('https://fpqjxkilatlcihunfxpb.supabase.co/functions/v1/build-complete',{method:'POST',headers:{'Content-Type':'application/json','x-callback-secret':process.env.CALLBACK_TOKEN},body:JSON.stringify(body)});if(r.ok){ok=true;break;}}catch{} await new Promise(r=>setTimeout(r,2000));}
+          if(!ok) throw new Error('Could not record the iOS build result');
+          NODE
+      - name: Remove signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/shippabel.keychain-db" || true
+          rm -f "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/profile.mobileprovision" "$RUNNER_TEMP/profile.plist"
